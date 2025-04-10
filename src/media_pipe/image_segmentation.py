@@ -199,11 +199,15 @@ class MediaPipeImageSegmentationNode:
                 }),
                 "threshold": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Confidence threshold for filtering mask values. Only pixels with confidence >= threshold are kept (when output_confidence_masks=True)."
+                    "tooltip": "Confidence threshold for filtering mask values. When output_confidence_masks=True, only pixels with confidence >= threshold retain their values, others become 0. When output_confidence_masks=False, this has no effect as MediaPipe internally uses a fixed threshold to generate category masks."
                 }),
                 "generate_visualization": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "When enabled, generates a colored visualization image showing the segmentation results. For multiclass models, each class gets a distinct color."
+                }),
+                "delegate_mode": (["cpu", "gpu"], {
+                    "default": "cpu",
+                    "tooltip": "Computation delegate to use. 'cpu' works on all platforms. 'gpu' may be faster but is not supported on Windows and requires GPU."
                 }),
             },
         }
@@ -227,10 +231,14 @@ Multiclass Segmentation Classes (for visualization and multiclass_segments):
 - 4: Clothes           (Green, RGB: 0,255,0)
 - 5: Accessories/Other (Magenta, RGB: 255,0,255)
 
+Threshold Usage:
+- In confidence mode (output_confidence_masks=True): Threshold controls which pixels appear in the output mask.
+- In category mode (output_confidence_masks=False): Threshold has no effect as MediaPipe internally uses fixed thresholds.
+
 Enable 'generate_visualization' to see colored results. Use the 'Select MediaPipe Segment' node to extract specific masks from 'multiclass_segments'."""
 
     # Function to initialize or update the segmenter if settings change
-    def _initialize_segmenter(self, model_path, output_confidence_masks):
+    def _initialize_segmenter(self, model_path, output_confidence_masks, delegate_mode="cpu"):
         # Check if re-initialization is needed (model path or output mode changed, or segmenter doesn't exist)
         if (self.segmenter is None or
             self.current_model_path != model_path or
@@ -256,6 +264,7 @@ Enable 'generate_visualization' to see colored results. Use the 'Select MediaPip
             print(f"[MediaPipeImageSegmentationNode] Initializing MediaPipe Image Segmenter...")
             print(f"  Model: {model_path}")
             print(f"  Output Confidence Masks: {output_confidence_masks}")
+            print(f"  Requested Delegate Mode: {delegate_mode}")
 
             BaseOptions = mp.tasks.BaseOptions
             ImageSegmenter = mp.tasks.vision.ImageSegmenter
@@ -263,16 +272,22 @@ Enable 'generate_visualization' to see colored results. Use the 'Select MediaPip
             VisionRunningMode = mp.tasks.vision.RunningMode
 
             try:
-                # Determine delegate based on availability and platform
-                delegate = BaseOptions.Delegate.CPU # Default to CPU
-                if platform.system().lower() != 'windows':
+                # Determine delegate based on requested mode and platform compatibility
+                delegate = BaseOptions.Delegate.CPU  # Default
+                
+                if delegate_mode.lower() == "gpu":
+                    # Check if platform is Windows
+                    if platform.system().lower() == 'windows':
+                        raise RuntimeError("GPU delegate is not supported on Windows platforms. Please use 'cpu' delegate mode instead.")
+                    
+                    # Check if GPU delegate is available in MediaPipe
                     if hasattr(BaseOptions.Delegate, 'GPU'):
                         delegate = BaseOptions.Delegate.GPU
-                        print("  Attempting to use GPU delegate (non-Windows platform).")
+                        print("  Using GPU delegate.")
                     else:
-                        print("  GPU delegate attribute not found, using CPU.")
+                        raise RuntimeError("GPU delegate requested but not available in the installed MediaPipe version. Please use 'cpu' delegate mode instead.")
                 else:
-                    print("  Windows platform detected, forcing CPU delegate.")
+                    print("  Using CPU delegate.")
 
                 print(f"  Using Delegate: {delegate.name}")
 
@@ -302,10 +317,7 @@ Enable 'generate_visualization' to see colored results. Use the 'Select MediaPip
                 self.current_model_path = model_path
                 self.current_output_confidence_masks = output_confidence_masks
                 # Raise the error
-                detailed_error = f"Failed to initialize MediaPipe Image Segmenter: {e}"
-                if "GPU Delegate is not yet supported" in str(e) or "GPU delegate failed" in str(e):
-                        detailed_error += " (Note: GPU acceleration might not be available or failed. Try CPU.)"
-                raise RuntimeError(detailed_error)
+                raise RuntimeError(f"Failed to initialize MediaPipe Image Segmenter: {e}")
         # else: # Optional: Log if reusing the existing segmenter
             # print("[MediaPipeImageSegmentationNode] Reusing existing segmenter instance.")
 
@@ -330,13 +342,17 @@ Enable 'generate_visualization' to see colored results. Use the 'Select MediaPip
 
     # Updated function signature to accept model_info and generate_visualization
     def segment_image(self, image: torch.Tensor, model_info: dict, output_confidence_masks: bool,
-                     threshold: float, generate_visualization: bool):
+                     threshold: float, generate_visualization: bool, delegate_mode: str = "cpu"):
         # Extract model path and name from the info dictionary
         model_path = model_info.get("model_path")
         model_name = model_info.get("model_name")
 
         if not model_path:
             raise ValueError("[MediaPipeImageSegmentationNode] Invalid model_info received (missing 'model_path')")
+
+        # Immediately validate GPU mode on Windows before any processing
+        if delegate_mode.lower() == "gpu" and platform.system().lower() == 'windows':
+            raise RuntimeError("[MediaPipeImageSegmentationNode] GPU acceleration is not supported on Windows platforms. Please set delegate_mode to 'cpu'.")
 
         # Check if this is a multiclass model
         is_multiclass = self.is_multiclass_model(model_name)
@@ -345,7 +361,7 @@ Enable 'generate_visualization' to see colored results. Use the 'Select MediaPip
 
         # Ensure segmenter is initialized with the correct settings
         try:
-             self._initialize_segmenter(model_path, output_confidence_masks)
+             self._initialize_segmenter(model_path, output_confidence_masks, delegate_mode)
         except Exception as e:
             raise RuntimeError(f"[MediaPipeImageSegmentationNode] Failed to initialize segmenter: {e}")
 
@@ -533,11 +549,11 @@ class SelectMediaPipeSegmentNode:
 NODE_CLASS_MAPPINGS = {
     "MediaPipeImageSegmentationNode": MediaPipeImageSegmentationNode,
     "MediaPipeModelLoaderNode": MediaPipeModelLoaderNode,
-    "SelectMediaPipeSegmentNode": SelectMediaPipeSegmentNode, # Add the new node
+    "SelectMediaPipeSegmentNode": SelectMediaPipeSegmentNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MediaPipeImageSegmentationNode": "MediaPipe Image Segmentation",
     "MediaPipeModelLoaderNode": "MediaPipe Model Loader",
-    "SelectMediaPipeSegmentNode": "Select MediaPipe Segment", # Add display name
+    "SelectMediaPipeSegmentNode": "Select MediaPipe Segment",
 }
