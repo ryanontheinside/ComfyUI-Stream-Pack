@@ -62,9 +62,12 @@ AVAILABLE_MODELS = {
         "filename": "selfie_multiclass_256x256.tflite"
     },
     # Add more models here as needed
+    # interactive segmentation, like sam2....
+    # https://storage.googleapis.com/mediapipe-models/interactive_segmenter/magic_touch/float32/latest/magic_touch.tflite
+    # https://ai.google.dev/edge/mediapipe/solutions/vision/interactive_segmenter?utm_source=chatgpt.com
+
 }
 
-# --- Model Loader Node ---
 class MediaPipeModelLoaderNode:
 
     @classmethod
@@ -173,6 +176,8 @@ class MediaPipeModelLoaderNode:
 
 class MediaPipeImageSegmentationNode:
 
+#TODO: sort out GPU delegate issues with mutliclass model
+
     def __init__(self):
         self.segmenter = None
         self.current_model_path = None
@@ -226,14 +231,27 @@ Enable 'generate_visualization' to see colored results. Use the 'Select MediaPip
 
     # Function to initialize or update the segmenter if settings change
     def _initialize_segmenter(self, model_path, output_confidence_masks):
-        # Check if re-initialization is needed
+        # Check if re-initialization is needed (model path or output mode changed, or segmenter doesn't exist)
         if (self.segmenter is None or
-            self.current_model_path != model_path or # Use the direct path
+            self.current_model_path != model_path or
             self.current_output_confidence_masks != output_confidence_masks):
 
+            # Close the existing segmenter *before* creating a new one if it exists
+            if hasattr(self, 'segmenter') and self.segmenter:
+                try:
+                    print("[MediaPipeImageSegmentationNode] Closing existing segmenter due to parameter change or initial setup.")
+                    self.segmenter.close()
+                except Exception as e:
+                    print(f"[MediaPipeImageSegmentationNode] Error closing existing segmenter: {e}")
+                finally:
+                    self.segmenter = None # Ensure it's reset
+
+            # Validate model path before attempting initialization
             if not model_path or not os.path.exists(model_path):
-                 # This check should ideally not fail if the loader node worked correctly, but good practice.
-                 raise FileNotFoundError(f"Model file path received from loader is invalid or file doesn't exist: '{model_path}'.")
+                # Store current params even if init fails, to avoid repeated init attempts with bad path
+                self.current_model_path = model_path
+                self.current_output_confidence_masks = output_confidence_masks
+                raise FileNotFoundError(f"Model file path is invalid or file doesn't exist: '{model_path}'. Cannot initialize segmenter.")
 
             print(f"[MediaPipeImageSegmentationNode] Initializing MediaPipe Image Segmenter...")
             print(f"  Model: {model_path}")
@@ -249,9 +267,6 @@ Enable 'generate_visualization' to see colored results. Use the 'Select MediaPip
                 delegate = BaseOptions.Delegate.CPU # Default to CPU
                 if platform.system().lower() != 'windows':
                     if hasattr(BaseOptions.Delegate, 'GPU'):
-                        # Check if delegate choice is valid before attempting to use it
-                        # NOTE: Actual availability might still depend on runtime factors.
-                        # MediaPipe often handles fallback internally if GPU isn't usable.
                         delegate = BaseOptions.Delegate.GPU
                         print("  Attempting to use GPU delegate (non-Windows platform).")
                     else:
@@ -263,30 +278,36 @@ Enable 'generate_visualization' to see colored results. Use the 'Select MediaPip
 
                 options = ImageSegmenterOptions(
                     base_options=BaseOptions(model_asset_path=model_path, delegate=delegate),
-                    running_mode=VisionRunningMode.IMAGE, # Process image by image
-                    output_category_mask=not output_confidence_masks, # Request category mask if not requesting confidence masks
+                    running_mode=VisionRunningMode.IMAGE,
+                    output_category_mask=not output_confidence_masks,
                     output_confidence_masks=output_confidence_masks
                 )
-                # Close existing segmenter before creating a new one
-                if self.segmenter:
-                    self.segmenter.close()
 
+                # Create the new segmenter instance
                 self.segmenter = ImageSegmenter.create_from_options(options)
+                # Store the current settings used for this segmenter instance
                 self.current_model_path = model_path
                 self.current_output_confidence_masks = output_confidence_masks
                 print(f"[MediaPipeImageSegmentationNode] MediaPipe Image Segmenter initialized successfully.")
+
             except Exception as e:
-                # Clean up state if initialization fails
-                if self.segmenter:
-                    self.segmenter.close()
+                # Clean up potentially partially created segmenter
+                if hasattr(self, 'segmenter') and self.segmenter:
+                    try:
+                        self.segmenter.close()
+                    except Exception as close_err:
+                        print(f"[MediaPipeImageSegmentationNode] Error closing segmenter during exception handling: {close_err}")
                 self.segmenter = None
-                self.current_model_path = None
-                self.current_output_confidence_masks = None
-                # Add more specific error info if possible
+                # Store params that caused the failure
+                self.current_model_path = model_path
+                self.current_output_confidence_masks = output_confidence_masks
+                # Raise the error
                 detailed_error = f"Failed to initialize MediaPipe Image Segmenter: {e}"
                 if "GPU Delegate is not yet supported" in str(e) or "GPU delegate failed" in str(e):
-                     detailed_error += " (Note: GPU acceleration for MediaPipe tasks might not be available or failed on your OS/hardware. Try CPU.)"
+                        detailed_error += " (Note: GPU acceleration might not be available or failed. Try CPU.)"
                 raise RuntimeError(detailed_error)
+        # else: # Optional: Log if reusing the existing segmenter
+            # print("[MediaPipeImageSegmentationNode] Reusing existing segmenter instance.")
 
     def is_multiclass_model(self, model_name):
         """Check if the model is a multiclass segmentation model"""
